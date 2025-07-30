@@ -9,101 +9,161 @@ on:
     inputs:
       box_name:
         description: 'Name for the Vagrant box'
-        required: true
+        required: false
         default: 'arvan-practices-vmware'
       box_version:
-        description: 'Version for the Vagrant box'
-        required: true
+        description: 'Version number for the box'
+        required: false
         default: '1.0.0'
 
 jobs:
   build-vmware-box:
-    runs-on: macos-latest  # Using macOS for VMware Fusion
+    runs-on: ubuntu-latest
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Install VMware Fusion
+    - name: Install VMware Workstation
       run: |
-        # Install VMware Fusion using Homebrew
-        brew install --cask vmware-fusion
+        # Download VMware Workstation Player (free version)
+        wget -O vmware-player.bundle "https://download3.vmware.com/software/player/file/VMware-Player-17.5.2-23775571.x86_64.bundle"
+        chmod +x vmware-player.bundle
+        sudo ./vmware-player.bundle --console --eulas-agreed --required
         
-    - name: Install Vagrant
+    - name: Install dependencies
       run: |
-        # Install Vagrant using Homebrew
-        brew install vagrant
+        sudo apt-get update
+        sudo apt-get install -y vagrant packer qemu-utils
         
-    - name: Install VMware Vagrant Plugin
+    - name: Install Vagrant VMware plugin
       run: |
         vagrant plugin install vagrant-vmware-desktop
         
-    - name: Create Box Directory
+    - name: Create Packer configuration
       run: |
-        mkdir -p output
-        
-    - name: Build Vagrant Box
-      run: |
-        # Set box name and version from inputs or use defaults
-        BOX_NAME="${GITHUB_EVENT_NAME == 'workflow_dispatch' && github.event.inputs.box_name || 'arvan-practices-vmware'}"
-        BOX_VERSION="${GITHUB_EVENT_NAME == 'workflow_dispatch' && github.event.inputs.box_version || '1.0.0'}"
-        
-        echo "Building box: $BOX_NAME version $BOX_VERSION"
-        
-        # Start the VM and package it
-        vagrant up --provider=vmware_desktop
-        vagrant package --output "output/${BOX_NAME}-${BOX_VERSION}.box"
-        vagrant destroy -f
-        
-    - name: Create Box Metadata
-      run: |
-        BOX_NAME="${GITHUB_EVENT_NAME == 'workflow_dispatch' && github.event.inputs.box_name || 'arvan-practices-vmware'}"
-        BOX_VERSION="${GITHUB_EVENT_NAME == 'workflow_dispatch' && github.event.inputs.box_version || '1.0.0'}"
-        
-        cat > "output/${BOX_NAME}-metadata.json" << EOF
+        cat > ubuntu-vmware.json << 'EOF'
         {
-          "name": "${BOX_NAME}",
-          "description": "Arvan Practices VMware Vagrant Box",
-          "versions": [
+          "builders": [
             {
-              "version": "${BOX_VERSION}",
-              "providers": [
-                {
-                  "name": "vmware_desktop",
-                  "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${BOX_VERSION}/${BOX_NAME}-${BOX_VERSION}.box",
-                  "checksum_type": "sha256",
-                  "checksum": "$(shasum -a 256 output/${BOX_NAME}-${BOX_VERSION}.box | cut -d' ' -f1)"
-                }
+              "type": "vmware-vmx",
+              "source_path": "https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso",
+              "ssh_username": "vagrant",
+              "ssh_password": "vagrant",
+              "ssh_timeout": "30m",
+              "shutdown_command": "echo 'vagrant' | sudo -S shutdown -P now",
+              "vmx_data": {
+                "memsize": "2048",
+                "numvcpus": "2",
+                "guestos": "ubuntu-64",
+                "scsi0.virtualDev": "lsisas1068",
+                "scsi0:0.present": "TRUE",
+                "scsi0:0.fileName": "disk.vmdk",
+                "scsi0:0.size": "20480",
+                "ethernet0.virtualDev": "e1000",
+                "ethernet0.present": "TRUE",
+                "ethernet0.connectionType": "bridged",
+                "ethernet0.wakeOnPcktRcv": "FALSE",
+                "sound.virtualDev": "hdaudio",
+                "sound.present": "TRUE",
+                "mks.enable3d": "TRUE",
+                "serial0.present": "TRUE",
+                "serial0.fileType": "thinprint",
+                "tools.syncTime": "TRUE",
+                "tools.guestlib.enableHostInfo": "TRUE"
+              }
+            }
+          ],
+          "provisioners": [
+            {
+              "type": "shell",
+              "inline": [
+                "sudo apt-get update",
+                "sudo apt-get install -y openssh-server",
+                "sudo systemctl enable ssh",
+                "sudo systemctl start ssh"
               ]
+            },
+            {
+              "type": "shell",
+              "inline": [
+                "sudo useradd -m -s /bin/bash vagrant",
+                "echo 'vagrant:vagrant' | sudo chpasswd",
+                "sudo usermod -aG sudo vagrant",
+                "echo 'vagrant ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/vagrant"
+              ]
+            },
+            {
+              "type": "shell",
+              "inline": [
+                "sudo mkdir -p /home/vagrant/.ssh",
+                "sudo wget --no-check-certificate https://raw.githubusercontent.com/hashicorp/vagrant/master/keys/vagrant.pub -O /home/vagrant/.ssh/authorized_keys",
+                "sudo chown -R vagrant:vagrant /home/vagrant/.ssh",
+                "sudo chmod 700 /home/vagrant/.ssh",
+                "sudo chmod 600 /home/vagrant/.ssh/authorized_keys"
+              ]
+            },
+            {
+              "type": "shell",
+              "inline": [
+                "sudo apt-get clean",
+                "sudo rm -rf /var/lib/apt/lists/*",
+                "sudo rm -f /var/log/wtmp /var/log/btmp",
+                "sudo rm -rf /tmp/* /var/tmp/*"
+              ]
+            }
+          ],
+          "post-processors": [
+            {
+              "type": "vagrant",
+              "output": "{{.BuildName}}-{{.Provider}}.box"
             }
           ]
         }
         EOF
         
-    - name: Upload Box Artifacts
+    - name: Build VMware box with Packer
+      run: |
+        packer build ubuntu-vmware.json
+        
+    - name: Create box metadata
+      run: |
+        cat > metadata.json << EOF
+        {
+          "name": "${{ github.event.inputs.box_name || 'arvan-practices-vmware' }}",
+          "version": "${{ github.event.inputs.box_version || '1.0.0' }}",
+          "provider": "vmware_desktop",
+          "description": "Ubuntu 24.04 VMware box for Arvan Practices",
+          "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        }
+        EOF
+        
+    - name: Upload box as artifact
       uses: actions/upload-artifact@v4
       with:
-        name: vagrant-box-vmware
-        path: output/
+        name: vmware-box
+        path: |
+          *.box
+          metadata.json
         retention-days: 30
         
     - name: Create GitHub Release
       if: github.event_name == 'workflow_dispatch'
       uses: softprops/action-gh-release@v1
       with:
-        files: output/*.box
-        tag_name: v${{ github.event.inputs.box_version }}
-        name: Release v${{ github.event.inputs.box_version }}
+        tag_name: v${{ github.event.inputs.box_version || '1.0.0' }}
+        name: VMware Box v${{ github.event.inputs.box_version || '1.0.0' }}
         body: |
-          VMware Vagrant Box Release
+          VMware Vagrant Box for Arvan Practices
           
-          - Box Name: ${{ github.event.inputs.box_name }}
-          - Version: ${{ github.event.inputs.box_version }}
-          - Provider: VMware Desktop
-          
-          Download the box file and add it to your Vagrant installation:
-          ```bash
-          vagrant box add ${{ github.event.inputs.box_name }} ${{ github.event.inputs.box_name }}-${{ github.event.inputs.box_version }}.box
-          ```
+          - Ubuntu 24.04 LTS
+          - VMware Desktop compatible
+          - Pre-configured with Vagrant user
+          - Ready for development environments
+        files: |
+          *.box
+          metadata.json
+        draft: false
+        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
